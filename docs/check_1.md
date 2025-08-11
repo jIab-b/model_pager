@@ -57,3 +57,13 @@ csrc/
 
 ## 6. Immediate Next Step
 Finish **todo3**: copy each parameter into the reserved UM slice and create tensors in-place via `tensor_from_um`; update `materialise` to reuse those tensors. This eliminates the duplicate GPU copy and unlocks true zero-copy paging.
+
+## 7. Future Improvement Ideas
+
+- **Look-ahead scheduler** – build a static op list so upcoming modules are prefetched while the current kernel runs, hiding UM latency.
+- **Eliminate duplicate host copies** – stream weights disk → UM directly (mmap + `cudaMemcpyAsync`) and drop the pinned CPU cache.
+- **Adjust page granularity** – experiment with 256 KiB–1 MiB logical pages to reduce fault counts on large matmuls.
+- **Multi-GPU pooling** – maintain one UM pool per device and use peer‐to‐peer `cudaMemPrefetchAsync` for migration.
+- **Optional weight compression** – store INT8/FP8 in UM and decompress in custom fused kernels to cut PCIe traffic.
+- **Allocator-driven paging for intermediates** – when near cap, move cold tensors back to host instead of throwing.
+- **Refactor bookkeeping to C++** – move LRU and state dict copy into a lightweight C++ shim if Python overhead shows up.

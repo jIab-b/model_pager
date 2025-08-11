@@ -6,7 +6,7 @@ _ext_path = pathlib.Path(__file__).resolve().parent.parent / "csrc"
 
 # Build the extension lazily and cache under torch extensions dir
 pager = load(name="weight_pager_ext",
-            sources=[str(_ext_path / "weight_pager.cu")],
+            sources=[str(_ext_path / "weight_pager.cu"), str(_ext_path / "um_tensor.cpp")],
             extra_include_paths=[str(_ext_path)],
             verbose=False)
 

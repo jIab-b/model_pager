@@ -15,6 +15,8 @@ from typing import Dict, Callable, Optional
 
 import safetensors.torch as safe
 import torch
+from . import _pager
+from . import _alloc
 
 __all__ = ["MemoryManager", "MetaModule", "register_kernel"]
 
@@ -67,6 +69,9 @@ class MemoryManager:
         self.pinned_limit = pinned_limit_mb * 1024**2
         self.vram_limit = None if vram_limit_mb is None else vram_limit_mb * 1024**2
 
+        if self.vram_limit is not None:
+            _alloc.set_cap(self.vram_limit)
+
         self._tiers: Dict[str, Dict] = {}      # name → {meta, path, …}
 
         # size-tracked FIFO pinned cache
@@ -74,18 +79,38 @@ class MemoryManager:
         self._pinned_fifo: Dict[str, Dict[str, torch.Tensor]] = {}
 
     # --------------- internal -------------------------------------- #
+    def _evict_until(self, bytes_needed: int):
+        """Release least-recently-used modules until freeing >= bytes_needed."""
+        freed = 0
+        # sort tiers by last used timestamp ascending
+        for name, info in sorted(self._tiers.items(), key=lambda kv: kv[1]["t"]):
+            if info["gpu"] is None:
+                continue
+            size = sum(p.element_size() * p.nelement() for p in info["gpu"].parameters())
+            self.release(name)
+            freed += size
+            if freed >= bytes_needed:
+                break
+        return freed
+
     def _ensure_vram(self, extra: int):
         if self.vram_limit is None:
             return
         torch.cuda.synchronize()
         used = torch.cuda.memory_allocated(self.gpu)
         if used + extra > self.vram_limit:
-            raise RuntimeError(f"VRAM cap exceeded: {used+extra} > {self.vram_limit}")
+            need = used + extra - self.vram_limit
+            freed = self._evict_until(need)
+            torch.cuda.synchronize()
+            used2 = torch.cuda.memory_allocated(self.gpu)
+            if used2 + extra > self.vram_limit:
+                raise RuntimeError("VRAM cap exceeded even after eviction")
 
     # ---------------- registration -------------------------------- #
     def register(self, name: str, meta: MetaModule, weights_path: str):
         self._tiers[name] = dict(meta=meta, path=weights_path,
-                                 cpu=None, gpu=None, t=0.0)
+                                 cpu=None, gpu=None, t=0.0,
+                                 um_ptr=None, um_pages=0)
 
     # ---------------- helpers ------------------------------------- #
     def _load_from_disk(self, name):
@@ -95,6 +120,14 @@ class MemoryManager:
 
         obj = safe.load_file(entry["path"], device="cpu",  # still CPU mem
                              lowercase=False, framework="pt")
+        # Allocate unified-memory pages once based on total size
+        if entry["um_ptr"] is None:
+            total_bytes = sum(v.element_size() * v.nelement() for v in obj.values())
+            pages = (total_bytes + _pager.PAGE_BYTES - 1) // _pager.PAGE_BYTES
+            entry["um_ptr"] = _pager.reserve(total_bytes)
+            entry["um_pages"] = pages
+            # TODO: copy individual param tensors into the UM block and record offsets
+            entry["offsets"] = {}
         # move to pinned (async copy helper)
         for k, v in obj.items():
             obj[k] = v.pin_memory()
@@ -121,6 +154,9 @@ class MemoryManager:
             # pre-check VRAM use
             size = sum(v.element_size() * v.nelement() for v in state.values())
             self._ensure_vram(size)
+            # prefetch weights into GPU memory (UMA)
+            if e["um_ptr"] is not None and e["um_pages"]:
+                _pager.prefetch(e["um_ptr"], e["um_pages"])
 
             e["gpu"] = e["meta"].materialise(state, self.gpu)
             e["t"] = time.time()
@@ -137,6 +173,8 @@ class MemoryManager:
             del e["gpu"]
             e["gpu"] = None
             torch.cuda.empty_cache()
+            if e["um_ptr"] is not None and e["um_pages"]:
+                _pager.evict(e["um_ptr"], e["um_pages"])
 
     # ---------- context manager for one-shot usage ---------------- #
     @contextlib.contextmanager

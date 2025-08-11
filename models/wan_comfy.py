@@ -38,7 +38,7 @@ def vae_skel():
     from comfy.ldm.wan import vae
     return vae.create_vae(device="meta")
 
-MM = MemoryManager(gpu="cuda", pinned_limit_mb=1024)
+MM = MemoryManager(gpu="cuda")
 
 MM.register("t5",         MetaModule(t5_skel),
             str(ROOT / "text_encoders" / "umt5_xxl_fp8_e4m3fn_scaled.safetensors"))

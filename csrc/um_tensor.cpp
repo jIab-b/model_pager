@@ -6,13 +6,19 @@
 // copying.  Only contiguous FP16 / FP32 tensors are handled for now.
 
 torch::Tensor tensor_from_um(void* ptr, std::vector<int64_t> sizes, c10::ScalarType dtype) {
-    c10::TensorOptions opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
-    auto storage = c10::Storage(c10::Storage::use_byte_size_t(),
-                                torch::numel(sizes) * (dtype == c10::ScalarType::Half ? 2 : 4),
-                                c10::IntrusivePtr<c10::StorageImpl>::reclaim(nullptr), /*resizable*/false);
-    // Placeholder: real implementation must create StorageImpl that owns ptr.
-    TORCH_WARN("tensor_from_um is a stub – returns empty tensor");
-    return torch::empty({0}, opts);
+    // Compute number of elements
+    int64_t numel = 1;
+    for (auto s : sizes) numel *= s;
+
+    // Build TensorOptions (cuda device, given dtype)
+    c10::TensorOptions opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA).requires_grad(false);
+
+    // Wrap the raw pointer without taking ownership (no-op deleter)
+    auto deleter = [](void* /*unused*/) {};
+
+    auto tensor = torch::from_blob(ptr, c10::IntArrayRef(sizes), deleter, opts);
+
+    return tensor;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

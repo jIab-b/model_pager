@@ -10,13 +10,90 @@ Tier-2  (GPU)          : the active layer
 """
 
 from __future__ import annotations
-import mmap, os, contextlib, functools, pathlib, time
+import mmap, os, contextlib, functools, pathlib, time, types
 from typing import Dict, Callable, Optional
+from torch.utils.cpp_extension import load
+
+# ------------------------------------------------------------------ #
+# Lightweight LazyModule (was in page_manager.py)                    #
+# ------------------------------------------------------------------ #
+class LazyModule(torch.nn.Module):
+    """Wrap a factory so weights load on first use and offload after call."""
+
+    def __init__(self, factory: Callable[[], torch.nn.Module], onload_device: torch.device, offload_device: torch.device, keep_in_gpu: float = 0.0):
+        super().__init__()
+        self._factory = factory
+        self._onload = onload_device
+        self._offload = offload_device
+        self._keep = keep_in_gpu
+        self._module: Optional[torch.nn.Module] = None
+
+    def _ensure_loaded(self):
+        if self._module is None:
+            self._module = self._factory().to(self._onload)
+            self._module.eval()
+
+    @contextlib.contextmanager
+    def _loaded(self):
+        self._ensure_loaded()
+        try:
+            yield self._module
+        finally:
+            if self._keep == 0:
+                self._module.to(self._offload)
+                torch.cuda.empty_cache()
+
+    def __getattr__(self, item):
+        if item in self.__dict__:
+            return super().__getattribute__(item)
+        self._ensure_loaded()
+        return getattr(self._module, item)
+
+    def forward(self, *args, **kwargs):
+        with self._loaded() as mod:
+            return mod(*args, **kwargs)
+
+
+def build_lazy_page_table(factories: Dict[str, Callable[[], torch.nn.Module]], onload_device: torch.device, offload_device: torch.device, keep_in_gpu: float = 0.0) -> Dict[str, 'LazyModule']:
+    """Return {name: LazyModule} for each factory."""
+    return {name: LazyModule(f, onload_device, offload_device, keep_in_gpu) for name, f in factories.items()}
 
 import safetensors.torch as safe
 import torch
-from . import _pager
-from . import _alloc
+
+# ------------------------------------------------------------------ #
+# Build CUDA extensions (pager & allocator)                          #
+# ------------------------------------------------------------------ #
+_csrc_path = pathlib.Path(__file__).resolve().parent.parent / "csrc"
+
+# weight pager (Unified Memory pool + tensor helper)
+_pager_ext = load(
+    name="weight_pager_ext",
+    sources=[str(_csrc_path / "weight_pager.cu"), str(_csrc_path / "um_tensor.cpp")],
+    extra_include_paths=[str(_csrc_path)],
+    verbose=False,
+)
+
+PAGE_BYTES = 64 * 1024
+
+# simple namespace to keep original attribute access style
+_pager = types.SimpleNamespace(
+    reserve=_pager_ext.pager_reserve,
+    prefetch=_pager_ext.pager_prefetch,
+    evict=_pager_ext.pager_evict,
+    tensor_from_um=_pager_ext.tensor_from_um,
+    PAGE_BYTES=PAGE_BYTES,
+)
+
+# allocator cap hook
+_alloc_ext = load(
+    name="alloc_hook_ext",
+    sources=[str(_csrc_path / "alloc_hook.cpp")],
+    extra_include_paths=[str(_csrc_path)],
+    verbose=False,
+)
+
+_alloc = types.SimpleNamespace(set_cap=_alloc_ext.set_cap)
 
 __all__ = ["MemoryManager", "MetaModule", "register_kernel"]
 
@@ -51,8 +128,12 @@ class MetaModule(torch.nn.Module):
 
         with torch.no_grad():
             for name, param in mod.named_parameters(recurse=True):
-                v = state_dict[name].to(device, non_blocking=True)
-                setattr(mod, name, torch.nn.Parameter(v, requires_grad=False))
+                v_src = state_dict[name]
+                if v_src.device == device:
+                    v_cuda = v_src
+                else:
+                    v_cuda = v_src.to(device, non_blocking=True)
+                setattr(mod, name, torch.nn.Parameter(v_cuda, requires_grad=False))
             for name, buf in mod.named_buffers(recurse=True):
                 if name in state_dict:
                     setattr(mod, name, state_dict[name].to(device, non_blocking=True))
@@ -64,9 +145,8 @@ class MetaModule(torch.nn.Module):
 # MemoryManager                                                      #
 # ------------------------------------------------------------------ #
 class MemoryManager:
-    def __init__(self, gpu: str = "cuda", pinned_limit_mb: int = 512, vram_limit_mb: int | None = None):
+    def __init__(self, gpu: str = "cuda", vram_limit_mb: int | None = None):
         self.gpu = torch.device(gpu)
-        self.pinned_limit = pinned_limit_mb * 1024**2
         self.vram_limit = None if vram_limit_mb is None else vram_limit_mb * 1024**2
 
         if self.vram_limit is not None:
@@ -74,9 +154,6 @@ class MemoryManager:
 
         self._tiers: Dict[str, Dict] = {}      # name → {meta, path, …}
 
-        # size-tracked FIFO pinned cache
-        self._pinned_used = 0
-        self._pinned_fifo: Dict[str, Dict[str, torch.Tensor]] = {}
 
     # --------------- internal -------------------------------------- #
     def _evict_until(self, bytes_needed: int):
@@ -109,7 +186,7 @@ class MemoryManager:
     # ---------------- registration -------------------------------- #
     def register(self, name: str, meta: MetaModule, weights_path: str):
         self._tiers[name] = dict(meta=meta, path=weights_path,
-                                 cpu=None, gpu=None, t=0.0,
+                                 gpu=None, t=0.0,
                                  um_ptr=None, um_pages=0)
 
     # ---------------- helpers ------------------------------------- #
@@ -126,20 +203,24 @@ class MemoryManager:
             pages = (total_bytes + _pager.PAGE_BYTES - 1) // _pager.PAGE_BYTES
             entry["um_ptr"] = _pager.reserve(total_bytes)
             entry["um_pages"] = pages
-            # TODO: copy individual param tensors into the UM block and record offsets
             entry["offsets"] = {}
-        # move to pinned (async copy helper)
-        for k, v in obj.items():
-            obj[k] = v.pin_memory()
-        size = sum(v.element_size() * v.nelement() for v in obj.values())
-        # evict if needed
-        while self._pinned_used + size > self.pinned_limit and self._pinned_fifo:
-            evict_name, evict_sd = self._pinned_fifo.popitem(last=False)
-            self._pinned_used -= sum(v.element_size() * v.nelement() for v in evict_sd.values())
-            self._tiers[evict_name]["cpu"] = None
-        self._pinned_fifo[name] = obj
-        self._pinned_used += size
-        entry["cpu"] = obj
+
+            # Copy each parameter tensor into the UM pool and wrap as CUDA tensor
+            offset = 0
+            for name, tensor in obj.items():
+                elem_bytes = tensor.element_size() * tensor.nelement()
+                dest_addr = entry["um_ptr"] + offset
+                # create view on UM memory (cuda device)
+                um_t = _pager.tensor_from_um(dest_addr, list(tensor.shape), tensor.dtype)
+                # copy data into UM (async if possible)
+                um_t.copy_(tensor, non_blocking=True)
+                obj[name] = um_t
+                del tensor  # free host tensor ASAP
+                entry["offsets"][name] = offset
+                offset += elem_bytes
+
+        # move to pinned (async copy helper) – now redundant since tensors are on UM
+        entry["cpu"] = None  # no longer needed
         return obj
 
     # ---------------- public API ---------------------------------- #

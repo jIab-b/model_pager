@@ -44,7 +44,8 @@ from diffusers import (
 from diffusers.schedulers import UniPCMultistepScheduler
 from transformers import UMT5EncoderModel
 from diffusers.utils import export_to_video
-from pysrc.page_manager import LazyModule
+from pysrc.core import LazyModule
+_LazyModule = LazyModule
 
 # ---------------------------------------------------------------------
 # 1.  A generic “lazy module” wrapper

@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.18)
+project(vllm_flow_native LANGUAGES C CXX CUDA)
+add_library(weight_pager SHARED weight_pager.cu)
+target_compile_features(weight_pager PUBLIC cxx_std_17)
+add_library(activation_pool SHARED activation_pool.cpp)
+target_compile_features(activation_pool PUBLIC cxx_std_17)

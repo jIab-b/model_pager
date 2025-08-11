@@ -18,7 +18,7 @@ from typing import List
 import torch, safetensors.torch as safe
 import comfy.ops, comfy.samplers, comfy.utils as cutils
 
-from mem.core import MetaModule, MemoryManager
+from pysrc.core import MetaModule, MemoryManager
 
 ROOT = Path.home() / "ComfyUI" / "models"
 

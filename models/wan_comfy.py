@@ -35,22 +35,11 @@ if "gelu_new" not in _t5mod.activations:
     _t5mod.activations["gelu_new"] = torch.nn.GELU(approximate="tanh")
 
 # meta-device ops 
-import torch.nn as _nn, types as _types
-_fallback = _types.SimpleNamespace(
-    Linear=lambda in_f, out_f, bias=False, **kw: _nn.Linear(in_f, out_f, bias=bias, device="meta"),
-    LayerNorm=lambda dim, eps=1e-5, **kw: _nn.LayerNorm(dim, eps, device="meta"),
-    Embedding=lambda n, d, **kw: _nn.Embedding(n, d, device="meta"),
-    Conv2d=lambda cin, cout, k, s=1, p=0, bias=True, **kw: _nn.Conv2d(cin, cout, k, s, p, bias=bias, device="meta"),
-    Conv3d=lambda cin, cout, k, s=1, p=0, bias=True, **kw: _nn.Conv3d(cin, cout, k, s, p, bias=bias, device="meta"),
-    ConvTranspose2d=lambda cin, cout, k, s=1, p=0, bias=True, **kw: _nn.ConvTranspose2d(cin, cout, k, s, p, bias=bias, device="meta"),
-    GroupNorm=lambda num_groups, num_channels, eps=1e-5, **kw: _nn.GroupNorm(num_groups, num_channels, eps=eps, device="meta"),
-    SiLU=lambda **kw: _nn.SiLU(),
-)
-for _name in _fallback.__dict__.keys():
-    if not hasattr(comfy.ops, _name):
-        setattr(comfy.ops, _name, getattr(_fallback, _name))
+import torch.nn as _nn
+from pysrc import meta_ops as _mops
 
-
+# Patch comfy.ops with our meta fallbacks (Linear, Conv*, RMSNorm, etc.)
+_mops.apply(comfy.ops)
 
 
 from pysrc.core import MetaModule, MemoryManager
@@ -67,12 +56,13 @@ def t5_skel():
     return t5.T5(cfg, device="meta", dtype=torch.float16, operations=comfy.ops)
 
 def wan_skel():
-    from comfy.ldm.wan import model as wan
-    return wan.create_model_from_config(checkpoint=None, device="meta", dtype=torch.float16)
+    from comfy.ldm.wan.model import WanModel
+    return WanModel(device="meta", dtype=torch.float16, operations=comfy.ops)
 
 def vae_skel():
-    from comfy.ldm.wan import vae
-    return vae.create_vae(device="meta")
+    from comfy.ldm.wan.vae import WanVAE
+    import torch
+    return WanVAE().to(device=torch.device("meta"), dtype=torch.float16)
 
 MM = MemoryManager(gpu="cuda")
 
@@ -84,21 +74,42 @@ MM.register("vae",        MetaModule(vae_skel),
             str(ROOT / "wan_2.1_vae.safetensors"))
 
 # ###### debug ###########################################################
-# save each component count to logs/comfy_*.log
-import safetensors.torch as _safe, pathlib as _pl, os as _os
-_logs_dir = (_pl.Path(__file__).resolve().parent.parent / "logs").resolve()
-_logs_dir.mkdir(parents=True, exist_ok=True)
-_file_map = {
-    "t5": ROOT / "umt5_xxl_fp16.safetensors",
-    "transformer": ROOT / "wan2.1_t2v_1.3B_fp16.safetensors",
-    "vae": ROOT / "wan_2.1_vae.safetensors",
-}
-for _name, _path in _file_map.items():
-    if _path.exists():
-        with _safe.safe_open(str(_path), framework="pt") as _sf:
-            _count = len(list(_sf.keys()))
-        (_logs_dir / f"comfy_{_name}.log").write_text(str(_count))
-# ###### debug ###########################################################
+def _debug_dump():
+    from pathlib import Path
+    import inspect
+    logs_dir = (Path(__file__).resolve().parent.parent / "logs").resolve()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    builders = {"t5": t5_skel, "wan": wan_skel, "vae": vae_skel}
+    import torch.fx as fx
+
+    for name, fn in builders.items():
+        model = fn()
+
+        # gather module class names
+        module_names = {m.__class__.__name__ for m in model.modules()}
+
+        # ops present (patched into comfy.ops)
+        ops_from_modules = {m.__class__.__qualname__ for m in model.modules() if m.__class__.__module__.startswith("comfy.ops")}
+        ops_global = {k for k, v in vars(comfy.ops).items() if callable(v)}
+
+        # FX trace of the skeleton
+        try:
+            traced = fx.symbolic_trace(model)
+            fx_lines = [f"{n.op}:{n.target}" for n in traced.graph.nodes]
+        except Exception as e:
+            fx_lines = [f"FX_trace_error:{e}"]
+            fx_lines += [f"module:{path}:{mod.__class__.__name__}" for path, mod in model.named_modules() if path]
+
+        out_lines = (
+            ["# MODULES"] + sorted(module_names) +
+            ["-- OPS"] + sorted(ops_from_modules | ops_global) +
+            ["-- FX_GRAPH"] + fx_lines
+        )
+
+        (logs_dir / f"comfy_log_{name}.log").write_text("\n".join(out_lines))
+
+
+ 
 
 # ---------------------------------------------------- #
 # 2.  Text → condition helper                          #
@@ -161,14 +172,4 @@ class Wan21:
 # 4.  Simple CLI                                       #
 # ---------------------------------------------------- #
 if __name__ == "__main__":
-    import argparse, imageio
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--prompt", required=True)
-    ap.add_argument("--out", default="wan21.mp4")
-    args = ap.parse_args()
-
-    gen = Wan21()
-    vid = gen(args.prompt)
-    imageio.mimsave(args.out,
-                    [f.permute(1,2,0).numpy() for f in vid], fps=16)
-    print("done →", args.out)
+    _debug_dump()

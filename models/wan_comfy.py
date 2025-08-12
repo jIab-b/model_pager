@@ -27,6 +27,32 @@ for path in [project_root, comfyui_root]:
 import torch, safetensors.torch as safe
 import comfy.ops, comfy.samplers, comfy.utils as cutils
 
+
+
+import comfy.text_encoders.t5 as _t5mod
+# ensure gelu_new activation present
+if "gelu_new" not in _t5mod.activations:
+    _t5mod.activations["gelu_new"] = torch.nn.GELU(approximate="tanh")
+
+# meta-device ops 
+import torch.nn as _nn, types as _types
+_fallback = _types.SimpleNamespace(
+    Linear=lambda in_f, out_f, bias=False, **kw: _nn.Linear(in_f, out_f, bias=bias, device="meta"),
+    LayerNorm=lambda dim, eps=1e-5, **kw: _nn.LayerNorm(dim, eps, device="meta"),
+    Embedding=lambda n, d, **kw: _nn.Embedding(n, d, device="meta"),
+    Conv2d=lambda cin, cout, k, s=1, p=0, bias=True, **kw: _nn.Conv2d(cin, cout, k, s, p, bias=bias, device="meta"),
+    Conv3d=lambda cin, cout, k, s=1, p=0, bias=True, **kw: _nn.Conv3d(cin, cout, k, s, p, bias=bias, device="meta"),
+    ConvTranspose2d=lambda cin, cout, k, s=1, p=0, bias=True, **kw: _nn.ConvTranspose2d(cin, cout, k, s, p, bias=bias, device="meta"),
+    GroupNorm=lambda num_groups, num_channels, eps=1e-5, **kw: _nn.GroupNorm(num_groups, num_channels, eps=eps, device="meta"),
+    SiLU=lambda **kw: _nn.SiLU(),
+)
+for _name in _fallback.__dict__.keys():
+    if not hasattr(comfy.ops, _name):
+        setattr(comfy.ops, _name, getattr(_fallback, _name))
+
+
+
+
 from pysrc.core import MetaModule, MemoryManager
 
 ROOT = Path("/home/beed1089/vllm/model_pager/safetensors")

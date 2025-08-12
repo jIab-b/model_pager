@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <mutex>
 
+// PyBind11 export is handled in um_tensor.cpp to avoid duplicate module symbol.
+
 namespace {
 static std::mutex g_pool_mtx;
 static void*      g_pool_ptr  = nullptr;

@@ -15,19 +15,29 @@ import json, random, os
 from pathlib import Path
 from typing import List
 
+# Add project root and ComfyUI to Python path
+import sys
+from pathlib import Path
+project_root = Path(__file__).parent.parent
+comfyui_root = Path("/home/beed1089/ComfyUI")
+for path in [project_root, comfyui_root]:
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
 import torch, safetensors.torch as safe
 import comfy.ops, comfy.samplers, comfy.utils as cutils
 
 from pysrc.core import MetaModule, MemoryManager
 
-ROOT = Path.home() / "ComfyUI" / "models"
+ROOT = Path("/home/beed1089/vllm/model_pager/safetensors")
 
 # ---------------------------------------------------- #
 # 1.  Build skeletons on meta device                   #
 # ---------------------------------------------------- #
 def t5_skel():
     from comfy.text_encoders import t5
-    cfg = json.load(open(ROOT / "text_encoders" / "umt5_xxl_config.json"))
+    cfg = json.load(open(ROOT / "umt5_xxl_config.json"))
+    cfg.setdefault("model_type", "umt5")
     return t5.T5(cfg, device="meta", dtype=torch.float16, operations=comfy.ops)
 
 def wan_skel():
@@ -41,11 +51,28 @@ def vae_skel():
 MM = MemoryManager(gpu="cuda")
 
 MM.register("t5",         MetaModule(t5_skel),
-            str(ROOT / "text_encoders" / "umt5_xxl_fp8_e4m3fn_scaled.safetensors"))
+            str(ROOT / "umt5_xxl_fp16.safetensors"))
 MM.register("transformer",MetaModule(wan_skel),
-            str(ROOT / "diffusion_models" / "wan2.1_t2v_1.3B_fp16.safetensors"))
+            str(ROOT / "wan2.1_t2v_1.3B_fp16.safetensors"))
 MM.register("vae",        MetaModule(vae_skel),
-            str(ROOT / "vae" / "wan_2.1_vae.safetensors"))
+            str(ROOT / "wan_2.1_vae.safetensors"))
+
+# ###### debug ###########################################################
+# save each component count to logs/comfy_*.log
+import safetensors.torch as _safe, pathlib as _pl, os as _os
+_logs_dir = (_pl.Path(__file__).resolve().parent.parent / "logs").resolve()
+_logs_dir.mkdir(parents=True, exist_ok=True)
+_file_map = {
+    "t5": ROOT / "umt5_xxl_fp16.safetensors",
+    "transformer": ROOT / "wan2.1_t2v_1.3B_fp16.safetensors",
+    "vae": ROOT / "wan_2.1_vae.safetensors",
+}
+for _name, _path in _file_map.items():
+    if _path.exists():
+        with _safe.safe_open(str(_path), framework="pt") as _sf:
+            _count = len(list(_sf.keys()))
+        (_logs_dir / f"comfy_{_name}.log").write_text(str(_count))
+# ###### debug ###########################################################
 
 # ---------------------------------------------------- #
 # 2.  Text → condition helper                          #

@@ -11,6 +11,7 @@ Tier-2  (GPU)          : the active layer
 
 from __future__ import annotations
 import mmap, os, contextlib, functools, pathlib, time, types
+import torch
 from typing import Dict, Callable, Optional
 from torch.utils.cpp_extension import load
 
@@ -85,15 +86,7 @@ _pager = types.SimpleNamespace(
     PAGE_BYTES=PAGE_BYTES,
 )
 
-# allocator cap hook
-_alloc_ext = load(
-    name="alloc_hook_ext",
-    sources=[str(_csrc_path / "alloc_hook.cpp")],
-    extra_include_paths=[str(_csrc_path)],
-    verbose=False,
-)
-
-_alloc = types.SimpleNamespace(set_cap=_alloc_ext.set_cap)
+# VRAM cap hook disabled – allocator extension removed.
 
 __all__ = ["MemoryManager", "MetaModule", "register_kernel"]
 
@@ -149,8 +142,7 @@ class MemoryManager:
         self.gpu = torch.device(gpu)
         self.vram_limit = None if vram_limit_mb is None else vram_limit_mb * 1024**2
 
-        if self.vram_limit is not None:
-            _alloc.set_cap(self.vram_limit)
+        # allocator cap disabled – no hard VRAM enforcement hook
 
         self._tiers: Dict[str, Dict] = {}      # name → {meta, path, …}
 

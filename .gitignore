@@ -1,3 +1,7 @@
 venv/
 *.so
 build/
+safetensors/
+logs/
+*.so
+*.pyc

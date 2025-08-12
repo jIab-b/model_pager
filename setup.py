@@ -12,13 +12,6 @@ setup(
             ],
             extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
         ),
-        CUDAExtension(
-            "alloc_hook_ext",
-            [
-                "csrc/alloc_hook.cpp",
-            ],
-            extra_compile_args={"cxx": ["-O3"], "nvcc": ["-O3"]},
-        ),
     ],
     cmdclass={"build_ext": BuildExtension},
 )

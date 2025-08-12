@@ -21,6 +21,11 @@ torch::Tensor tensor_from_um(void* ptr, std::vector<int64_t> sizes, c10::ScalarT
     return tensor;
 }
 
+#include <pybind11/pybind11.h>
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("tensor_from_um", &tensor_from_um, "Create Tensor from UM ptr (stub)");
+    m.def("tensor_from_um", &tensor_from_um, "Create Tensor from UM ptr");
+    m.def("pager_reserve",  &pager_reserve,  "Reserve unified-memory bytes");
+    m.def("pager_prefetch", &pager_prefetch, "Prefetch pages to GPU");
+    m.def("pager_evict",    &pager_evict,    "Evict pages to CPU");
 }

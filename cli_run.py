@@ -15,13 +15,9 @@ for path in [project_root, comfyui_root]:
         sys.path.insert(0, str(path))
 
 
-
-
-
 import torch, comfy.samplers
-
-
-
+import page_table_ext as _pager
+from pysrc.scheduler import SequentialScheduler
 
 
 
@@ -29,7 +25,14 @@ import torch, comfy.samplers
 # Import wan_comfy to register skeletons & MemoryManager
 from models import wan_comfy as wc
 MM = wc.MM
+SCHED = SequentialScheduler(MM)  # scheduler instance
 ROOT = Path(__file__).parent / "safetensors"
+for name in ("t5", "transformer", "vae"):
+    entry = MM._tiers[name]
+    module_names = list(entry["offsets"].keys())
+    offsets = list(entry["offsets"].values())
+    sizes = list(entry["sizes"].values())
+    _pager.register_model(name, str(entry["path"]), len(module_names), module_names, offsets, sizes)
 
 
 
@@ -47,7 +50,7 @@ _tok = T5Tokenizer.from_pretrained("google/umt5-xxl")
 def encode(prompt: str):
     ids = _tok(prompt, padding="max_length", truncation=True,
                 max_length=256, return_tensors="pt").input_ids
-    with MM.use("t5") as t5:
+    with SCHED.module("t5") as t5:
         return t5(ids.cuda(non_blocking=True))[0]
 
 # -----------------------------------------------------------------------
@@ -73,10 +76,10 @@ def generate(prompt: str, negative: str, H: int, W: int, T: int,
     )
 
     for s in sampler:
-        with MM.use("transformer") as tfm:
+        with SCHED.module("transformer") as tfm:
             lat = s(lat, cond, ncond, model_override=tfm)
 
-    with MM.use("vae") as vae:
+    with SCHED.module("vae") as vae:
         frames = vae.decode(lat)
     return frames.cpu()
 
@@ -90,16 +93,16 @@ def main():
     ap.add_argument("--steps", type=int, default=25)
     ap.add_argument("--cfg", type=float, default=5.0)
     ap.add_argument("--seed", type=int, default=-1)
+    ap.add_argument("--scan", action="store_true", help="List registered modules and exit")
     args = ap.parse_args()
 
    
    
-   # vid = generate(args.prompt, args.negative, H=480, W=832, T=81,
-   #                steps=args.steps, cfg=args.cfg, seed=args.seed)
-   # imageio.mimsave(args.out, [f.permute(1,2,0).numpy() for f in vid], fps=16)
+    vid = generate(args.prompt, args.negative, H=480, W=832, T=81,
+                   steps=args.steps, cfg=args.cfg, seed=args.seed)
+    imageio.mimsave(args.out, [f.permute(1,2,0).cpu().numpy() for f in vid], fps=16)
     print("done →", args.out)
 
-    write_mm_logs()
 
 
 # -----------------------------------------------------------------------

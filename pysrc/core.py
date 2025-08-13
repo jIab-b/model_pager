@@ -178,7 +178,7 @@ class MemoryManager:
     # ---------------- registration -------------------------------- #
     def register(self, name: str, meta: MetaModule, weights_path: str):
         self._tiers[name] = dict(meta=meta, path=weights_path,
-                                 gpu=None, t=0.0,
+                                 gpu=None, cpu=None, t=0.0,
                                  um_ptr=None, um_pages=0)
 
     # ---------------- helpers ------------------------------------- #
@@ -187,13 +187,14 @@ class MemoryManager:
         if entry["cpu"] is not None:
             return entry["cpu"]             # cached in pinned
 
-        obj = safe.load_file(entry["path"], device="cpu",  # still CPU mem
-                             lowercase=False, framework="pt")
+        obj = safe.load_file(entry["path"], device="cpu")
         # Allocate unified-memory pages once based on total size
         if entry["um_ptr"] is None:
             total_bytes = sum(v.element_size() * v.nelement() for v in obj.values())
             pages = (total_bytes + _pager.PAGE_BYTES - 1) // _pager.PAGE_BYTES
             entry["um_ptr"] = _pager.reserve(total_bytes)
+            if not entry["um_ptr"]:  # 0 or None indicates OOM
+                raise MemoryError(f"Unified Memory reserve failed for {name}: {total_bytes} bytes")
             entry["um_pages"] = pages
             entry["offsets"] = {}
 

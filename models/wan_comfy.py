@@ -74,13 +74,37 @@ MM.register("vae",        MetaModule(vae_skel),
             str(ROOT / "wan_2.1_vae.safetensors"))
 
 # ###### debug ###########################################################
+# ---------------------------- DEBUG DUMPS ----------------------------- #
+# Basic dump: modules + ops (no FX)
 def _debug_dump():
     from pathlib import Path
-    import inspect
+    logs_dir = (Path(__file__).resolve().parent.parent / "logs").resolve()
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    builders = {"t5": t5_skel, "wan": wan_skel, "vae": vae_skel}
+
+    for name, fn in builders.items():
+        model = fn()
+
+        module_names = {m.__class__.__name__ for m in model.modules()}
+        ops_from_modules = {m.__class__.__qualname__ for m in model.modules() if m.__class__.__module__.startswith("comfy.ops")}
+        ops_global = {k for k, v in vars(comfy.ops).items() if callable(v)}
+
+        out_lines = (
+            ["# MODULES"] + sorted(module_names) +
+            ["-- OPS"] + sorted(ops_from_modules | ops_global)
+        )
+
+        (logs_dir / f"comfy_log_{name}.log").write_text("\n".join(out_lines))
+
+
+# Extended dump: includes FX trace (relies on torch.fx; useful on larger GPU)
+def _debug_dump_fx():
+    from pathlib import Path
+    import torch.fx as fx
     logs_dir = (Path(__file__).resolve().parent.parent / "logs").resolve()
     logs_dir.mkdir(parents=True, exist_ok=True)
     builders = {"t5": t5_skel, "wan": wan_skel, "vae": vae_skel}
-    import torch.fx as fx
 
     for name, fn in builders.items():
         model = fn()
@@ -106,70 +130,14 @@ def _debug_dump():
             ["-- FX_GRAPH"] + fx_lines
         )
 
-        (logs_dir / f"comfy_log_{name}.log").write_text("\n".join(out_lines))
+        (logs_dir / f"comfy_log_{name}_fx.log").write_text("\n".join(out_lines))
 
 
  
 
 # ---------------------------------------------------- #
-# 2.  Text → condition helper                          #
+# 3.  Entrypoint for offline logging                    #
 # ---------------------------------------------------- #
-from transformers import T5Tokenizer
-_tok = T5Tokenizer.from_pretrained("google/umt5-xxl")
 
-def encode(prompt: str) -> torch.Tensor:
-    ids = _tok(prompt,
-               padding="max_length", truncation=True,
-               max_length=256, return_tensors="pt").input_ids
-    with MM.use("t5") as t5:
-        return t5(ids.cuda(non_blocking=True))[0]
-
-# ---------------------------------------------------- #
-# 3.  Top-level generator                              #
-# ---------------------------------------------------- #
-class Wan21:
-    def __init__(self, fp16=True):
-        self.dtype = torch.float16 if fp16 else torch.bfloat16
-
-    @torch.inference_mode()
-    def __call__(self,
-                 prompt: str,
-                 negative: str = "",
-                 H: int = 480,
-                 W: int = 832,
-                 T: int = 81,
-                 steps: int = 25,
-                 cfg: float = 5.0,
-                 seed: int | None = None) -> List[torch.Tensor]:
-
-        if seed is None or seed < 0: seed = random.randint(0,2**31)
-
-        cond  = encode(prompt)
-        ncond = encode(negative) if negative else None
-
-        lat = torch.randn(1,4,T,H//8,W//8,
-                          device="cuda", dtype=self.dtype)
-
-        sampler = comfy.samplers.KSampler(
-            model=None,     # we override on-the-fly
-            steps=steps,
-            cfg_scale=cfg,
-            sampler_name="dpmpp_2m",
-            scheduler="karras",
-            seed=seed,
-        )
-
-        for s in sampler:
-            with MM.use("transformer") as tfm:
-                lat = s(lat, cond, ncond, model_override=tfm)
-
-        with MM.use("vae") as vae:
-            frames = vae.decode(lat)
-
-        return frames.cpu()
-
-# ---------------------------------------------------- #
-# 4.  Simple CLI                                       #
-# ---------------------------------------------------- #
 if __name__ == "__main__":
     _debug_dump()

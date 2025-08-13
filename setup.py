@@ -11,7 +11,7 @@ setup(
             name='page_table_ext',
             sources=[
                 'csrc/weight_pager.cu',
-                'csrc/um_tensor.cpp',
+                'csrc/binding.cpp',
                 'csrc/page_table.cpp',
             ],
             include_dirs=['csrc'],

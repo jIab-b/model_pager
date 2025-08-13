@@ -16,7 +16,6 @@ for path in [project_root, comfyui_root]:
 
 
 import torch, comfy.samplers
-import page_table_ext as _pager
 from pysrc.scheduler import SequentialScheduler
 
 
@@ -27,12 +26,7 @@ from models import wan_comfy as wc
 MM = wc.MM
 SCHED = SequentialScheduler(MM)  # scheduler instance
 ROOT = Path(__file__).parent / "safetensors"
-for name in ("t5", "transformer", "vae"):
-    entry = MM._tiers[name]
-    module_names = list(entry["offsets"].keys())
-    offsets = list(entry["offsets"].values())
-    sizes = list(entry["sizes"].values())
-    _pager.register_model(name, str(entry["path"]), len(module_names), module_names, offsets, sizes)
+# Paging handled in scheduler: reserve/prefetch/evict per module
 
 
 
@@ -95,7 +89,9 @@ def main():
     ap.add_argument("--seed", type=int, default=-1)
     ap.add_argument("--scan", action="store_true", help="List registered modules and exit")
     args = ap.parse_args()
-
+    if args.scan:
+        print(list(MM._tiers.keys()))
+        return
    
    
     vid = generate(args.prompt, args.negative, H=480, W=832, T=81,

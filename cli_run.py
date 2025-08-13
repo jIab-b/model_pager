@@ -128,7 +128,13 @@ def write_mm_logs():
             except Exception:
                 pass
 
-        info = {k: str(v) for k, v in tier.items()}
+        info = {
+            "um_ptr": tier.get("um_ptr"),
+            "um_pages": tier.get("um_pages"),
+            "gpu_loaded": tier["gpu"] is not None,
+            "offsets": tier.get("offsets"),
+            "sizes": tier.get("sizes"),
+        }
         (logs_dir / f"log_MM_{name}.log").write_text(pprint.pformat(info))
 
 if __name__ == "__main__":

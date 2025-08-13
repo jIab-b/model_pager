@@ -142,10 +142,9 @@ class MemoryManager:
         self.gpu = torch.device(gpu)
         self.vram_limit = None if vram_limit_mb is None else vram_limit_mb * 1024**2
 
+        self._tiers: Dict[str, Dict] = {}
+        self._page_table: Dict[str, Dict] = {}  # global param → meta info
         # allocator cap disabled – no hard VRAM enforcement hook
-
-        self._tiers: Dict[str, Dict] = {}      # name → {meta, path, …}
-
 
     # --------------- internal -------------------------------------- #
     def _evict_until(self, bytes_needed: int):
@@ -177,9 +176,38 @@ class MemoryManager:
 
     # ---------------- registration -------------------------------- #
     def register(self, name: str, meta: MetaModule, weights_path: str):
-        self._tiers[name] = dict(meta=meta, path=weights_path,
-                                 gpu=None, cpu=None, t=0.0,
-                                 um_ptr=None, um_pages=0)
+        # Read tensor metadata to build offsets & sizes (CPU-only, no GPU mem)
+        try:
+            obj = safe.load_file(weights_path, device="cpu")
+        except Exception as e:
+            raise RuntimeError(f"Failed to read header of {weights_path}: {e}")
+
+        offsets: Dict[str, int] = {}
+        sizes: Dict[str, int] = {}
+        offs = 0
+        for tname, ten in obj.items():
+            nbytes = ten.element_size() * ten.nelement()
+            offsets[tname] = offs
+            sizes[tname] = nbytes
+            # update global page table key = module.param
+            self._page_table[f"{name}.{tname}"] = dict(path=weights_path,
+                                                        bytes=nbytes,
+                                                        offset=offs,
+                                                        module=name,
+                                                        dtype=str(ten.dtype))
+            offs += nbytes
+        # remove heavy cpu tensors asap
+        del obj
+
+        self._tiers[name] = dict(meta=meta,
+                                 path=weights_path,
+                                 gpu=None,
+                                 cpu=None,
+                                 t=0.0,
+                                 um_ptr=None,
+                                 um_pages=0,
+                                 offsets=offsets,
+                                 sizes=sizes)
 
     # ---------------- helpers ------------------------------------- #
     def _load_from_disk(self, name):

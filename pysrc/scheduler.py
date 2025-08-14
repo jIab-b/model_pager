@@ -16,10 +16,15 @@ class SequentialScheduler:
 
     @contextlib.contextmanager
     def module(self, name: str, *args):
-        # Reserve and prefetch full model memory for this module
         entry = self.mm._tiers[name]
-        total_bytes = sum(entry['sizes'].values())
-        _pager.model_reserve(total_bytes)
+        order = sorted(entry['offsets'].items(), key=lambda kv: kv[1])
+        file_offsets = [off for _, off in order]
+        sizes = [entry['sizes'][k] for k, _ in order]
+        _pager.model_set_weights_layout(file_offsets, sizes)
+        total_bytes = _pager.model_planned_bytes() if hasattr(_pager, 'model_planned_bytes') else sum(entry['sizes'].values())
+        _pager.model_reserve(int(total_bytes))
+        if hasattr(_pager, 'model_stage_file'):
+            _pager.model_stage_file(entry['path'], int(8 << 20))
         _pager.model_prefetch()
         try:
             # Call the registered Python kernel through C extension

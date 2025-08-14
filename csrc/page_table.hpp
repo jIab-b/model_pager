@@ -15,6 +15,13 @@ extern "C" {
     void  model_prefetch();
     void  model_evict();
 
+    // page table & staging
+    void  model_set_weights_layout(const std::size_t* file_offsets,
+                                   const std::size_t* sizes,
+                                   int count);
+    void  model_stage_file(const char* path, std::size_t chunk_bytes);
+    std::size_t model_planned_bytes();
+
     // memory stats
     void  get_memory_stats(std::size_t* uma_reserved,
                            std::size_t* uma_used,

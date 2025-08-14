@@ -54,3 +54,5 @@ extern "C" void pager_evict(const void* pages, int n) {
     std::size_t bytes = static_cast<std::size_t>(n) * PAGER_PAGE_BYTES;
     cudaMemPrefetchAsync(const_cast<void*>(pages), bytes, cudaCpuDeviceId, 0);
 }
+
+// removed pager_touch

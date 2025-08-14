@@ -10,6 +10,7 @@
 namespace py = pybind11;
 
 static std::unordered_map<std::string, torch::jit::script::Module> g_jit_modules;
+static std::unordered_map<std::string, py::function> g_py_kernels;
 
 // Wrap UM ptr as Tensor
 torch::Tensor tensor_from_um(void* ptr, std::vector<int64_t> sizes, c10::ScalarType dtype) {
@@ -29,6 +30,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("model_reserve",     &model_reserve,     "Reserve UMA for entire model");
     m.def("model_prefetch",    &model_prefetch,    "Prefetch UMA pages for model");
     m.def("model_evict",       &model_evict,       "Evict UMA pages for model");
+    
+    m.def("model_set_weights_layout", [](py::list file_offsets, py::list sizes) {
+        const int count = static_cast<int>(py::len(file_offsets));
+        if (count != static_cast<int>(py::len(sizes))) throw std::runtime_error("layout arrays mismatch");
+        std::vector<std::size_t> offs(count), szs(count);
+        for (int i = 0; i < count; ++i) {
+            offs[i] = file_offsets[i].cast<std::size_t>();
+            szs[i] = sizes[i].cast<std::size_t>();
+        }
+        model_set_weights_layout(offs.data(), szs.data(), count);
+    }, "Set per-tensor file offsets and sizes for UMA layout");
+    m.def("model_stage_file", [](const std::string &path, std::size_t chunk_bytes) {
+        model_stage_file(path.c_str(), chunk_bytes);
+    }, "Stage weights from safetensors file into UMA");
+    m.def("model_planned_bytes", &model_planned_bytes, "Get planned UMA total bytes");
 
     m.def("get_memory_stats",  []() {
         size_t r,u,a,f;
@@ -52,4 +68,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         at::IValue out = it->second.forward(ivals);
         return out.toTensor();
     }, "Launch a loaded TorchScript module");
+
+    m.def("register_kernel", [](const std::string &name, py::function fn) {
+        g_py_kernels[name] = std::move(fn);
+    }, "Register a Python callable as a kernel for a module name");
+
+    m.def("launch_kernel", [](const std::string &name, const std::vector<at::Tensor> &inputs) {
+        auto it = g_py_kernels.find(name);
+        if (it == g_py_kernels.end())
+            throw std::runtime_error("Kernel not registered: " + name);
+        py::tuple args(inputs.size());
+        for (size_t i = 0; i < inputs.size(); ++i) args[i] = py::cast(inputs[i]);
+        py::object out = it->second(*args);
+        return out.cast<at::Tensor>();
+    }, "Launch a registered Python kernel by name");
 }

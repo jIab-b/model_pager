@@ -16,12 +16,34 @@ for path in [project_root, comfyui_root]:
 
 
 import torch, comfy.samplers
-from pysrc.scheduler import SequentialScheduler
 import page_table_ext as _pager
 from models.wan_comfy import t5_skel, wan_skel, vae_skel
-# Register Python kernels in C extension
-#for name, builder in [("t5", t5_skel), ("transformer", wan_skel), ("vae", vae_skel)]:
-#    _pager.register_kernel(name, lambda *inputs, b=builder: b().to("cuda")(*inputs))
+
+# Ensure extension provides kernel registration/launch; rebuild if necessary
+try:
+    have_kernel_api = hasattr(_pager, 'register_kernel') and hasattr(_pager, 'launch_kernel')
+except Exception:
+    have_kernel_api = False
+if not have_kernel_api:
+    from torch.utils.cpp_extension import load
+    from pathlib import Path as _P
+    _csrc = _P(__file__).parent / 'csrc'
+    _pager = load(name='page_table_ext', sources=[str(_csrc / 'weight_pager.cu'), str(_csrc / 'page_table.cpp'), str(_csrc / 'binding.cpp')], extra_include_paths=[str(_csrc)], verbose=False)
+    import sys as _sys
+    _sys.modules['page_table_ext'] = _pager
+
+# Register simple placeholder Python kernels to validate launch path
+def _kernel_t5(ids):
+    return ids
+def _kernel_transformer(lat, cond, ncond=None):
+    return lat
+def _kernel_vae(lat):
+    return lat
+for _name, _fn in [("t5", _kernel_t5), ("transformer", _kernel_transformer), ("vae", _kernel_vae)]:
+    if hasattr(_pager, 'register_kernel'):
+        _pager.register_kernel(_name, _fn)
+
+from pysrc.scheduler import SequentialScheduler
 
 
 
@@ -99,10 +121,10 @@ def main():
         print(list(MM._tiers.keys()))
         return
    
-    write_mm_logs()
-    #vid = generate(args.prompt, args.negative, H=480, W=832, T=81,
-    #               steps=args.steps, cfg=args.cfg, seed=args.seed)
-    #imageio.mimsave(args.out, [f.permute(1,2,0).cpu().numpy() for f in vid], fps=16)
+    #write_mm_logs()
+    vid = generate(args.prompt, args.negative, H=480, W=832, T=81,
+                   steps=args.steps, cfg=args.cfg, seed=args.seed)
+    imageio.mimsave(args.out, [f.permute(1,2,0).cpu().numpy() for f in vid], fps=16)
     print("done →", args.out)
 
 

@@ -1,85 +1,90 @@
 #include <torch/extension.h>
-#include <torch/script.h>
-#include "page_table.hpp"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
+#include "page_table.hpp"
+#include <cuda_runtime.h>
 #include <unordered_map>
-#include <vector>
-#include <string>
 
 namespace py = pybind11;
 
-static std::unordered_map<std::string, torch::jit::script::Module> g_jit_modules;
-static std::unordered_map<std::string, py::function> g_py_kernels;
+namespace {
+static std::unordered_map<int, cudaGraphExec_t> G;
+static int NEXT_GID = 1;
+}
 
-// Wrap UM ptr as Tensor
-torch::Tensor tensor_from_um(void* ptr, std::vector<int64_t> sizes, c10::ScalarType dtype) {
-    int64_t numel = 1;
-    for (auto s : sizes) numel *= s;
-    c10::TensorOptions opts = torch::TensorOptions().dtype(dtype).device(torch::kCUDA).requires_grad(false);
-    auto deleter = [](void* /*unused*/) {};
-    return torch::from_blob(ptr, c10::IntArrayRef(sizes), deleter, opts);
+static int do_capture(py::function fn) {
+    cudaStream_t s; cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    cudaGraph_t g; cudaGraphExec_t exec;
+    cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
+    {
+        py::gil_scoped_acquire gil;
+        fn();
+    }
+    cudaStreamEndCapture(s, &g);
+    cudaGraphInstantiate(&exec, g, nullptr, nullptr, 0);
+    cudaGraphDestroy(g);
+    cudaStreamDestroy(s);
+    int id = NEXT_GID++;
+    G[id] = exec;
+    return id;
+}
+
+static void do_replay(int id, py::object stream_idx_opt) {
+    auto it = G.find(id); if (it == G.end()) return;
+    cudaStream_t s; cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
+    cudaGraphLaunch(it->second, s);
+    cudaStreamSynchronize(s);
+    cudaStreamDestroy(s);
+}
+
+static void do_destroy(int id) {
+    auto it = G.find(id); if (it == G.end()) return;
+    cudaGraphExecDestroy(it->second);
+    G.erase(it);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("tensor_from_um",    &tensor_from_um,    "Create Tensor from UM ptr");
-    m.def("pager_reserve",     &pager_reserve,     "Reserve unified-memory bytes");
-    m.def("pager_prefetch",    &pager_prefetch,    "Prefetch pages to GPU");
-    m.def("pager_evict",       &pager_evict,       "Evict pages to CPU");
+    m.def("runtime_init", &runtime_init, py::arg("device_id"), py::arg("compute_streams") = 2, py::arg("io_streams") = 1);
+    m.def("runtime_shutdown", &runtime_shutdown);
 
-    m.def("model_reserve",     &model_reserve,     "Reserve UMA for entire model");
-    m.def("model_prefetch",    &model_prefetch,    "Prefetch UMA pages for model");
-    m.def("model_evict",       &model_evict,       "Evict UMA pages for model");
-    
-    m.def("model_set_weights_layout", [](py::list file_offsets, py::list sizes) {
-        const int count = static_cast<int>(py::len(file_offsets));
-        if (count != static_cast<int>(py::len(sizes))) throw std::runtime_error("layout arrays mismatch");
-        std::vector<std::size_t> offs(count), szs(count);
-        for (int i = 0; i < count; ++i) {
-            offs[i] = file_offsets[i].cast<std::size_t>();
-            szs[i] = sizes[i].cast<std::size_t>();
+    m.def("model_register", [](const std::string& path,
+                                 const std::vector<std::size_t>& offsets,
+                                 const std::vector<std::size_t>& sizes) {
+        return model_register(path.c_str(), offsets.data(), sizes.data(), static_cast<int>(sizes.size()));
+    });
+    m.def("model_close", &model_close);
+    m.def("model_tensor_size", &model_tensor_size);
+    m.def("gds_available", &gds_available);
+
+    m.def("model_read_into", [](int handle, int index, at::Tensor dst, py::object io_stream_opt) {
+        TORCH_CHECK(dst.is_cuda(), "dst must be CUDA tensor");
+        void* ptr = dst.data_ptr();
+        std::size_t bytes = static_cast<std::size_t>(dst.nbytes());
+        int io_stream = io_stream_opt.is_none() ? 0 : io_stream_opt.cast<int>();
+        model_read_into(handle, index, ptr, bytes, io_stream);
+    });
+
+    m.def("model_read_into_batch", [](int handle, const std::vector<int>& indices, const std::vector<at::Tensor>& dsts, py::object io_stream_opt) {
+        TORCH_CHECK(indices.size() == dsts.size(), "indices and dsts size mismatch");
+        std::vector<void*> ptrs(dsts.size());
+        std::vector<std::size_t> bytes(dsts.size());
+        for (size_t i = 0; i < dsts.size(); ++i) {
+            TORCH_CHECK(dsts[i].is_cuda(), "dst ", i, " must be CUDA tensor");
+            ptrs[i] = dsts[i].data_ptr();
+            bytes[i] = static_cast<std::size_t>(dsts[i].nbytes());
         }
-        model_set_weights_layout(offs.data(), szs.data(), count);
-    }, "Set per-tensor file offsets and sizes for UMA layout");
-    m.def("model_stage_file", [](const std::string &path, std::size_t chunk_bytes) {
-        model_stage_file(path.c_str(), chunk_bytes);
-    }, "Stage weights from safetensors file into UMA");
-    m.def("model_planned_bytes", &model_planned_bytes, "Get planned UMA total bytes");
+        int io_stream = io_stream_opt.is_none() ? 0 : io_stream_opt.cast<int>();
+        model_read_into_batch(handle, indices.data(), (void* const*)ptrs.data(), bytes.data(), static_cast<int>(indices.size()), io_stream);
+    });
 
-    m.def("get_memory_stats",  []() {
-        size_t r,u,a,f;
-        get_memory_stats(&r,&u,&a,&f);
-        return py::make_tuple(r,u,a,f);
-    }, "Get UMA and GPU memory stats");
-
-    m.def("load_module", [](const std::string &name, const std::string &path) {
-        torch::jit::script::Module module = torch::jit::load(path);
-        module.eval();
-        g_jit_modules[name] = std::move(module);
-    }, "Load TorchScript module");
-
-    m.def("launch_module", [](const std::string &name, const std::vector<at::Tensor> &inputs) {
-        auto it = g_jit_modules.find(name);
-        if (it == g_jit_modules.end())
-            throw std::runtime_error("Module not loaded: " + name);
-        std::vector<c10::IValue> ivals;
-        ivals.reserve(inputs.size());
-        for (const auto &t : inputs) ivals.emplace_back(t);
-        at::IValue out = it->second.forward(ivals);
-        return out.toTensor();
-    }, "Launch a loaded TorchScript module");
-
-    m.def("register_kernel", [](const std::string &name, py::function fn) {
-        g_py_kernels[name] = std::move(fn);
-    }, "Register a Python callable as a kernel for a module name");
-
-    m.def("launch_kernel", [](const std::string &name, const std::vector<at::Tensor> &inputs) {
-        auto it = g_py_kernels.find(name);
-        if (it == g_py_kernels.end())
-            throw std::runtime_error("Kernel not registered: " + name);
-        py::tuple args(inputs.size());
-        for (size_t i = 0; i < inputs.size(); ++i) args[i] = py::cast(inputs[i]);
-        py::object out = it->second(*args);
-        return out.cast<at::Tensor>();
-    }, "Launch a registered Python kernel by name");
+    m.def("wait_all", &wait_all);
+    m.def("get_memory_stats", [](){
+        std::size_t ga=0, gf=0; get_memory_stats(&ga, &gf); return py::make_tuple(ga, gf);
+    });
+    m.def("graph_capture", &do_capture, py::arg("callable"));
+    m.def("graph_replay",  &do_replay, py::arg("graph_id"), py::arg("compute_stream").none(true));
+    m.def("graph_destroy", &do_destroy, py::arg("graph_id"));
 }
+
+

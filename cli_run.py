@@ -1,169 +1,27 @@
 #!/usr/bin/env python
-"""Simple end-to-end text-to-video run using MemoryManager paging.
-Runs on a single GPU with ≤8 GB VRAM (RTX 2060 Super class).
-"""
-import argparse, random, imageio
-from pathlib import Path
-
-
+import argparse
 import sys
 from pathlib import Path
+
 project_root = Path(__file__).parent
-comfyui_root = Path("/home/beed1089/ComfyUI")
-for path in [project_root, comfyui_root]:
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
+from pysrc.t5 import encode as t5_encode
 
-import torch, comfy.samplers
-import page_table_ext as _pager
-from models.wan_comfy import t5_skel, wan_skel, vae_skel
-
-# Ensure extension provides kernel registration/launch; rebuild if necessary
-try:
-    have_kernel_api = hasattr(_pager, 'register_kernel') and hasattr(_pager, 'launch_kernel')
-except Exception:
-    have_kernel_api = False
-if not have_kernel_api:
-    from torch.utils.cpp_extension import load
-    from pathlib import Path as _P
-    _csrc = _P(__file__).parent / 'csrc'
-    _pager = load(name='page_table_ext', sources=[str(_csrc / 'weight_pager.cu'), str(_csrc / 'page_table.cpp'), str(_csrc / 'binding.cpp')], extra_include_paths=[str(_csrc)], verbose=False)
-    import sys as _sys
-    _sys.modules['page_table_ext'] = _pager
-
-# Register simple placeholder Python kernels to validate launch path
-def _kernel_t5(ids):
-    return ids
-def _kernel_transformer(lat, cond, ncond=None):
-    return lat
-def _kernel_vae(lat):
-    return lat
-for _name, _fn in [("t5", _kernel_t5), ("transformer", _kernel_transformer), ("vae", _kernel_vae)]:
-    if hasattr(_pager, 'register_kernel'):
-        _pager.register_kernel(_name, _fn)
-
-from pysrc.scheduler import SequentialScheduler
-
-
-
-
-# Import wan_comfy to register skeletons & MemoryManager
-from models import wan_comfy as wc
-MM = wc.MM
-SCHED = SequentialScheduler(MM)  # scheduler instance
-ROOT = Path(__file__).parent / "safetensors"
-# Paging handled in scheduler: reserve/prefetch/evict per module
-
-
-
-
-
-
-
-# --- tokenizer ---------------------------------------------------------
-from transformers import T5Tokenizer
-
-_tok = T5Tokenizer.from_pretrained("google/umt5-xxl")
-
-
-
-def encode(prompt: str):
-    ids = _tok(prompt, padding="max_length", truncation=True,
-                max_length=256, return_tensors="pt").input_ids
-    with SCHED.module("t5", ids.cuda(non_blocking=True)) as out:
-        return out[0]
-
-# -----------------------------------------------------------------------
-
-def generate(prompt: str, negative: str, H: int, W: int, T: int,
-             steps: int, cfg: float, seed: int):
-    dtype = torch.float16
-    if seed < 0:
-        seed = random.randint(0, 2**31)
-
-    cond  = encode(prompt)
-    ncond = encode(negative) if negative else None
-
-    lat = torch.randn(1, 4, T, H//8, W//8, device="cuda", dtype=dtype)
-
-    sampler = comfy.samplers.KSampler(
-        model=None,
-        steps=steps,
-        cfg_scale=cfg,
-        sampler_name="dpmpp_2m",
-        scheduler="karras",
-        seed=seed,
-    )
-
-    for s in sampler:
-        lat = s(lat, cond, ncond)
-        with SCHED.module("transformer", lat, cond, ncond) as out:
-            lat = out
-
-    with SCHED.module("vae", lat) as out:
-        frames = out
-    return frames.cpu()
-
-# -----------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prompt", required=True)
-    ap.add_argument("--negative", default="")
-    ap.add_argument("--out", default="wan21.mp4")
-    ap.add_argument("--steps", type=int, default=25)
-    ap.add_argument("--cfg", type=float, default=5.0)
-    ap.add_argument("--seed", type=int, default=-1)
-    ap.add_argument("--scan", action="store_true", help="List registered modules and exit")
+    ap.add_argument("--max_length", type=int, default=256)
+    ap.add_argument("--save", type=str, default=str(Path("logs")/"t5_emb.pt"))
+    ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
-    if args.scan:
-        print(list(MM._tiers.keys()))
-        return
-   
-    #write_mm_logs()
-    vid = generate(args.prompt, args.negative, H=480, W=832, T=81,
-                   steps=args.steps, cfg=args.cfg, seed=args.seed)
-    imageio.mimsave(args.out, [f.permute(1,2,0).cpu().numpy() for f in vid], fps=16)
-    print("done →", args.out)
-
-
-
-# -----------------------------------------------------------------------
-# Log helper
-# -----------------------------------------------------------------------
-
-
-
-def write_mm_logs():
-    from pathlib import Path
-    import pprint
-    logs_dir = Path(__file__).resolve().parent / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    for name in list(MM._tiers.keys()):
-        tier = MM._tiers[name]
-        try:
-            if tier.get("offsets") is None:
-                MM.acquire(name)
-        except MemoryError as e:
-            info = {"error": str(e)}
-            (logs_dir / f"log_MM_{name}.log").write_text(repr(info))
-            continue
-        finally:
-            try:
-                MM.release(name)
-            except Exception:
-                pass
-        info = {k: str(v) for k, v in tier.items()}
-        info = {
-            "um_ptr": tier.get("um_ptr"),
-            "um_pages": tier.get("um_pages"),
-            "gpu_loaded": tier["gpu"] is not None,
-            "offsets": tier.get("offsets"),
-            "sizes": tier.get("sizes"),
-        }
-        (logs_dir / f"log_MM_{name}.log").write_text(pprint.pformat(info))
+    _ = t5_encode(args.prompt, max_length=args.max_length, out_path=args.save, debug=args.debug)
+    print(f"t5 encode saved → {args.save}")
 
 
 if __name__ == "__main__":
     main()
+
+

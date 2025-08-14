@@ -1,30 +1,39 @@
 #pragma once
-#include <cstddef>
 
-// Page granularity (64 KiB)
-constexpr std::size_t PAGER_PAGE_BYTES = 64 * 1024;
+#include <cstddef>
+#include <cstdint>
+
+static constexpr std::size_t PAGER_PAGE_BYTES = 64u * 1024u;
 
 extern "C" {
-    // pager core
-    void* pager_reserve(std::size_t bytes);
-    void  pager_prefetch(const void* pages, int n);
-    void  pager_evict(const void* pages, int n);
+    void runtime_init(int device_id, int compute_streams, int io_streams);
+    void runtime_shutdown();
 
-    // single-model API
-    void  model_reserve(std::size_t bytes);
-    void  model_prefetch();
-    void  model_evict();
+    int model_register(const char* path,
+                       const std::size_t* file_offsets,
+                       const std::size_t* sizes,
+                       int count);
+    void model_close(int handle);
+    std::size_t model_tensor_size(int handle, int index);
+    int gds_available();
 
-    // page table & staging
-    void  model_set_weights_layout(const std::size_t* file_offsets,
-                                   const std::size_t* sizes,
-                                   int count);
-    void  model_stage_file(const char* path, std::size_t chunk_bytes);
-    std::size_t model_planned_bytes();
+    void model_read_into(int handle,
+                         int index,
+                         void* dst_device_ptr,
+                         std::size_t bytes,
+                         int io_stream);
 
-    // memory stats
-    void  get_memory_stats(std::size_t* uma_reserved,
-                           std::size_t* uma_used,
-                           std::size_t* gpu_allocated,
-                           std::size_t* gpu_free);
+    void model_read_into_batch(int handle,
+                               const int* indices,
+                               void* const* dst_device_ptrs,
+                               const std::size_t* bytes,
+                               int n,
+                               int io_stream);
+
+    void wait_all();
+
+    void get_memory_stats(std::size_t* gpu_allocated,
+                          std::size_t* gpu_free);
 }
+
+

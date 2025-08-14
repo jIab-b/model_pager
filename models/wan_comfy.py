@@ -84,17 +84,21 @@ def _debug_dump():
     builders = {"t5": t5_skel, "wan": wan_skel, "vae": vae_skel}
 
     for name, fn in builders.items():
-        model = fn()
-
+        model = fn()  # This builds on meta device
+        
         module_names = {m.__class__.__name__ for m in model.modules()}
         ops_from_modules = {m.__class__.__qualname__ for m in model.modules() if m.__class__.__module__.startswith("comfy.ops")}
         ops_global = {k for k, v in vars(comfy.ops).items() if callable(v)}
-
+        
+        # Extract shapes and sizes from meta parameters without loading weights
+        shapes_and_sizes = {k: (v.shape, v.numel() * v.element_size()) for k, v in model.named_parameters()}  # Meta tensors have shapes
+        
         out_lines = (
             ["# MODULES"] + sorted(module_names) +
-            ["-- OPS"] + sorted(ops_from_modules | ops_global)
+            ["-- OPS"] + sorted(ops_from_modules | ops_global) +
+            ["-- SHAPES_AND_SIZES"] + [f"{k}: shape={shape}, size={size} bytes" for k, (shape, size) in shapes_and_sizes.items()]
         )
-
+        
         (logs_dir / f"comfy_log_{name}.log").write_text("\n".join(out_lines))
 
 

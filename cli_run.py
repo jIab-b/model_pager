@@ -17,6 +17,11 @@ for path in [project_root, comfyui_root]:
 
 import torch, comfy.samplers
 from pysrc.scheduler import SequentialScheduler
+import page_table_ext as _pager
+from models.wan_comfy import t5_skel, wan_skel, vae_skel
+# Register Python kernels in C extension
+#for name, builder in [("t5", t5_skel), ("transformer", wan_skel), ("vae", vae_skel)]:
+#    _pager.register_kernel(name, lambda *inputs, b=builder: b().to("cuda")(*inputs))
 
 
 
@@ -44,8 +49,8 @@ _tok = T5Tokenizer.from_pretrained("google/umt5-xxl")
 def encode(prompt: str):
     ids = _tok(prompt, padding="max_length", truncation=True,
                 max_length=256, return_tensors="pt").input_ids
-    with SCHED.module("t5") as t5:
-        return t5(ids.cuda(non_blocking=True))[0]
+    with SCHED.module("t5", ids.cuda(non_blocking=True)) as out:
+        return out[0]
 
 # -----------------------------------------------------------------------
 
@@ -70,11 +75,12 @@ def generate(prompt: str, negative: str, H: int, W: int, T: int,
     )
 
     for s in sampler:
-        with SCHED.module("transformer") as tfm:
-            lat = s(lat, cond, ncond, model_override=tfm)
+        lat = s(lat, cond, ncond)
+        with SCHED.module("transformer", lat, cond, ncond) as out:
+            lat = out
 
-    with SCHED.module("vae") as vae:
-        frames = vae.decode(lat)
+    with SCHED.module("vae", lat) as out:
+        frames = out
     return frames.cpu()
 
 # -----------------------------------------------------------------------
@@ -93,10 +99,10 @@ def main():
         print(list(MM._tiers.keys()))
         return
    
-   
-    vid = generate(args.prompt, args.negative, H=480, W=832, T=81,
-                   steps=args.steps, cfg=args.cfg, seed=args.seed)
-    imageio.mimsave(args.out, [f.permute(1,2,0).cpu().numpy() for f in vid], fps=16)
+    write_mm_logs()
+    #vid = generate(args.prompt, args.negative, H=480, W=832, T=81,
+    #               steps=args.steps, cfg=args.cfg, seed=args.seed)
+    #imageio.mimsave(args.out, [f.permute(1,2,0).cpu().numpy() for f in vid], fps=16)
     print("done →", args.out)
 
 
@@ -105,15 +111,15 @@ def main():
 # Log helper
 # -----------------------------------------------------------------------
 
+
+
 def write_mm_logs():
     from pathlib import Path
     import pprint
     logs_dir = Path(__file__).resolve().parent / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-
     for name in list(MM._tiers.keys()):
         tier = MM._tiers[name]
-        # Force one-time load to generate offsets/UM info if not present
         try:
             if tier.get("offsets") is None:
                 MM.acquire(name)
@@ -126,7 +132,7 @@ def write_mm_logs():
                 MM.release(name)
             except Exception:
                 pass
-
+        info = {k: str(v) for k, v in tier.items()}
         info = {
             "um_ptr": tier.get("um_ptr"),
             "um_pages": tier.get("um_pages"),
@@ -135,6 +141,7 @@ def write_mm_logs():
             "sizes": tier.get("sizes"),
         }
         (logs_dir / f"log_MM_{name}.log").write_text(pprint.pformat(info))
+
 
 if __name__ == "__main__":
     main()

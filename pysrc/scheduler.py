@@ -15,15 +15,16 @@ class SequentialScheduler:
         self.mm = memory_manager
 
     @contextlib.contextmanager
-    def module(self, name: str):
-        # Reserve and prefetch full model memory
+    def module(self, name: str, *args):
+        # Reserve and prefetch full model memory for this module
         entry = self.mm._tiers[name]
-        total_bytes = sum(entry["sizes"].values())
+        total_bytes = sum(entry['sizes'].values())
         _pager.model_reserve(total_bytes)
         _pager.model_prefetch()
         try:
-            with self.mm.use(name) as mod:
-                yield mod
+            # Call the registered Python kernel through C extension
+            result = _pager.launch_kernel(name, list(args))
+            yield result
         finally:
             _pager.model_evict()
 

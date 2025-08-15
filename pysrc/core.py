@@ -79,6 +79,95 @@ def index_safetensors(path: str):
         shapes[name] = tuple(info["shape"])
     return offsets, sizes, dtypes, shapes
 
+def _read_header_len(path: str) -> int:
+    with open(path, "rb") as f:
+        return int.from_bytes(f.read(8), "little")
+
+# handle sharded safetensors files. 
+def index_safetensors_any(path: str):
+    p = pathlib.Path(path)
+    if p.is_dir():
+        idx = p / "model.safetensors.index.json"
+        if idx.exists():
+            path = str(idx)
+        else:
+            shard_files = sorted([str(x) for x in p.glob("*.safetensors")])
+            merged_offsets: Dict[str, int] = {}
+            merged_sizes: Dict[str, int] = {}
+            merged_dtypes: Dict[str, str] = {}
+            merged_shapes: Dict[str, tuple] = {}
+            tensor_files: Dict[str, str] = {}
+            header_lens: Dict[str, int] = {}
+            for fp in shard_files:
+                off, sz, dt, sh = index_safetensors(fp)
+                header_lens[fp] = _read_header_len(fp)
+                for k in off.keys():
+                    merged_offsets[k] = off[k]
+                    merged_sizes[k] = sz[k]
+                    merged_dtypes[k] = dt[k]
+                    merged_shapes[k] = sh[k]
+                    tensor_files[k] = fp
+            return dict(
+                is_sharded=True,
+                path=None,
+                files=shard_files,
+                tensor_files=tensor_files,
+                header_lens=header_lens,
+                offsets=merged_offsets,
+                sizes=merged_sizes,
+                dtypes=merged_dtypes,
+                shapes=merged_shapes,
+            )
+    if str(path).endswith(".index.json"):
+        idx_path = pathlib.Path(path)
+        data = json.loads(idx_path.read_text())
+        weight_map = data.get("weight_map", {})
+        shard_files = sorted(list({str(idx_path.parent / v) for v in weight_map.values()}))
+        merged_offsets: Dict[str, int] = {}
+        merged_sizes: Dict[str, int] = {}
+        merged_dtypes: Dict[str, str] = {}
+        merged_shapes: Dict[str, tuple] = {}
+        tensor_files: Dict[str, str] = {}
+        header_lens: Dict[str, int] = {}
+        per_file_index: Dict[str, tuple] = {}
+        for fp in shard_files:
+            off, sz, dt, sh = index_safetensors(fp)
+            per_file_index[fp] = (off, sz, dt, sh)
+            header_lens[fp] = _read_header_len(fp)
+        for tensor, rel_file in weight_map.items():
+            fp = str(idx_path.parent / rel_file)
+            off, sz, dt, sh = per_file_index[fp]
+            if tensor not in off:
+                continue
+            merged_offsets[tensor] = off[tensor]
+            merged_sizes[tensor] = sz[tensor]
+            merged_dtypes[tensor] = dt[tensor]
+            merged_shapes[tensor] = sh[tensor]
+            tensor_files[tensor] = fp
+        return dict(
+            is_sharded=True,
+            path=str(idx_path),
+            files=shard_files,
+            tensor_files=tensor_files,
+            header_lens=header_lens,
+            offsets=merged_offsets,
+            sizes=merged_sizes,
+            dtypes=merged_dtypes,
+            shapes=merged_shapes,
+        )
+    off, sz, dt, sh = index_safetensors(str(path))
+    return dict(
+        is_sharded=False,
+        path=str(path),
+        files=[str(path)],
+        tensor_files={k: str(path) for k in off.keys()},
+        header_lens={str(path): _read_header_len(str(path))},
+        offsets=off,
+        sizes=sz,
+        dtypes=dt,
+        shapes=sh,
+    )
+
 __all__ = ["MemoryManager", "MetaModule", "register_kernel"]
 
 # ------------------------------------------------------------------ #
@@ -156,27 +245,31 @@ class MemoryManager:
             if used2 + extra > self.vram_limit:
                 raise RuntimeError("VRAM cap exceeded even after eviction")
     def register(self, name: str, meta: MetaModule, weights_path: str):
-        offsets, sizes, dtypes, shapes = index_safetensors(weights_path)
+        idx = index_safetensors_any(weights_path)
         self._tiers[name] = dict(
             meta=meta,
-            path=weights_path,
+            path=idx["path"],
+            files=idx["files"],
+            tensor_files=idx["tensor_files"],
+            header_lens=idx["header_lens"],
+            is_sharded=idx["is_sharded"],
             gpu=None,
             cpu=None,
             t=0.0,
             um_ptr=None,
             um_pages=0,
-            offsets=offsets,
-            sizes=sizes,
-            dtypes=dtypes,
-            shapes=shapes,
+            offsets=idx["offsets"],
+            sizes=idx["sizes"],
+            dtypes=idx["dtypes"],
+            shapes=idx["shapes"],
         )
-        for tname, nbytes in sizes.items():
+        for tname, nbytes in idx["sizes"].items():
             self._page_table[f"{name}.{tname}"] = dict(
-                path=weights_path,
+                path=self._tiers[name]["tensor_files"][tname],
                 bytes=nbytes,
-                offset=offsets[tname],
+                offset=idx["offsets"][tname],
                 module=name,
-                dtype=dtypes[tname],
+                dtype=idx["dtypes"][tname],
             )
     def _load_from_disk(self, name):
         raise NotImplementedError("Weight loading disabled in Python-only index mode")

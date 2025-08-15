@@ -11,6 +11,43 @@ import re
 import page_table_ext as _pager
 from transformers import T5Tokenizer
 from models.wan_comfy import t5_skel, MM
+import contextlib
+
+_DBG_DEPTH = 0
+_DBG_FILE = None
+_DBG_STDOUT = None
+_DBG_STDERR = None
+
+def _debug_redirect_enter(enabled: bool, log_name: str = "t5_debug.log"):
+    global _DBG_DEPTH, _DBG_FILE, _DBG_STDOUT, _DBG_STDERR
+    if not enabled:
+        return
+    if _DBG_DEPTH == 0:
+        logs_dir = (Path(__file__).resolve().parent.parent / "logs").resolve()
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        _DBG_FILE = open(logs_dir / log_name, "a", buffering=1)
+        _DBG_STDOUT = sys.stdout
+        _DBG_STDERR = sys.stderr
+        sys.stdout = _DBG_FILE
+        sys.stderr = _DBG_FILE
+    _DBG_DEPTH += 1
+
+def _debug_redirect_exit():
+    global _DBG_DEPTH, _DBG_FILE, _DBG_STDOUT, _DBG_STDERR
+    if _DBG_DEPTH <= 0:
+        return
+    _DBG_DEPTH -= 1
+    if _DBG_DEPTH == 0 and _DBG_FILE is not None:
+        sys.stdout = _DBG_STDOUT
+        sys.stderr = _DBG_STDERR
+        try:
+            _DBG_FILE.flush()
+            _DBG_FILE.close()
+        finally:
+            pass
+        _DBG_FILE = None
+        _DBG_STDOUT = None
+        _DBG_STDERR = None
 
 _DTYPE_MAP = {
     "F16": torch.float16,
@@ -185,6 +222,7 @@ def _peek_shared_row(path: str, base: int, off: int, d_model: int, row_idx: int,
         return np.frombuffer(buf, dtype=np.float32)
 
 def encode(prompt: str, max_length: int = 256, out_path: str | None = None, debug: bool = False):
+    _debug_redirect_enter(debug)
     _pager.runtime_init(0, 2, 1)
     h, all_names = _build_registry()
     tok = T5Tokenizer.from_pretrained("google/umt5-xxl")
@@ -354,9 +392,11 @@ def encode(prompt: str, max_length: int = 256, out_path: str | None = None, debu
         out_cpu_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(out_cpu, out_cpu_path)
     print(f"[T5] output shape: {tuple(x.shape)} sum={x.float().abs().sum().item():.3f} mean={x.float().mean().item():.6f}")
+    _debug_redirect_exit()
     return x
 
 def decode(decoder_ids: torch.Tensor, encoder_hidden: torch.Tensor, tok: T5Tokenizer, h: int, all_names: list[str], model, device, dtypes_map, debug: bool = False):
+    _debug_redirect_enter(debug)
     tier = MM._tiers["t5"]
     if debug:
         print(f"[DBG] decode: ids shape={tuple(decoder_ids.shape)}")
@@ -492,6 +532,7 @@ def decode(decoder_ids: torch.Tensor, encoder_hidden: torch.Tensor, tok: T5Token
     _page_into(h, [fn], all_names, {fn: fin}); _pager.wait_all()
     y = _rmsnorm(y, fin)
     del fin; torch.cuda.empty_cache()
+    _debug_redirect_exit()
     return y
 
 def _prepare_cross_kv(encoder_hidden: torch.Tensor, h: int, all_names: list[str], model, device, dtypes_map, debug: bool = False):
@@ -524,6 +565,7 @@ def _prepare_cross_kv(encoder_hidden: torch.Tensor, h: int, all_names: list[str]
     return cross
 
 def generate(prompt: str, max_length: int = 256, max_new_tokens: int = 16, debug: bool = False):
+    _debug_redirect_enter(debug)
     _pager.runtime_init(0, 2, 1)
     h, all_names = _build_registry()
     tok = T5Tokenizer.from_pretrained("google/umt5-xxl")
@@ -639,6 +681,7 @@ def generate(prompt: str, max_length: int = 256, max_new_tokens: int = 16, debug
         if debug:
             print(f"[DBG] step {t+1}: next_id={int(next_id[0].item())}")
     _pager.wait_all(); _pager.model_close(h); _pager.runtime_shutdown()
+    _debug_redirect_exit()
     return dec_ids
 
 

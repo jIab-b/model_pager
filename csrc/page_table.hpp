@@ -8,6 +8,7 @@ static constexpr std::size_t PAGER_PAGE_BYTES = 64u * 1024u;
 extern "C" {
     void runtime_init(int device_id, int compute_streams, int io_streams);
     void runtime_shutdown();
+    void set_chunk_bytes(std::size_t bytes);
 
     int model_register(const char* path,
                        const std::size_t* file_offsets,
@@ -22,6 +23,12 @@ extern "C" {
                          void* dst_device_ptr,
                          std::size_t bytes,
                          int io_stream);
+    void model_read_into_sched(int handle,
+                               int index,
+                               void* dst_device_ptr,
+                               std::size_t bytes,
+                               int io_stream,
+                               int compute_stream);
 
     void model_read_into_batch(int handle,
                                const int* indices,
@@ -34,6 +41,10 @@ extern "C" {
 
     void get_memory_stats(std::size_t* gpu_allocated,
                           std::size_t* gpu_free);
+
+    void cache_configure(std::size_t gpu_bytes, std::size_t cpu_pinned_bytes);
+    void cache_clear(int level);
+    void cache_stats(std::size_t* gpu_used, int* gpu_items, std::size_t* cpu_used, int* cpu_items);
 }
 
 
